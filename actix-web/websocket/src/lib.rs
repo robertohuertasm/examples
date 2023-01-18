@@ -8,53 +8,98 @@ use actix_web_actors::ws;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use shuttle_service::ShuttleActixWeb;
-use std::{sync::Arc, time::Duration};
-use tokio::sync::{watch, Mutex};
+use std::{collections::HashSet, time::Duration};
 
 const PAUSE_SECS: u64 = 15;
 const STATUS_URI: &str = "https://api.shuttle.rs";
 
-struct AppState {
-    clients_count: usize,
-    rx: watch::Receiver<Response>,
+// actor used to check the api and send messages to all the ws actors
+#[derive(Default)]
+struct ApiCheckerActor {
+    addresses: HashSet<Addr<WsActor>>,
+}
+
+// message sent from the ws actors when they connect or disconnect
+// used to keep track of the number of connected clients
+#[derive(actix::Message, Clone, Debug)]
+#[rtype(result = "()")]
+enum ApiCheckerMessage {
+    Connected(Addr<WsActor>),
+    Disconnected(Addr<WsActor>),
 }
 
 #[derive(Serialize, actix::Message, Default, Clone, Debug)]
 #[rtype(result = "()")]
-struct Response {
+struct ApiCheckerResponse {
     clients_count: usize,
     date_time: DateTime<Utc>,
     is_up: bool,
 }
 
+impl Actor for ApiCheckerActor {
+    type Context = Context<Self>;
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+        let duration = Duration::from_secs(PAUSE_SECS);
+        let client = reqwest::Client::default();
+
+        ctx.run_interval(duration, move |_, ctx| {
+            let addr = ctx.address();
+            let client = client.clone();
+            let _fut = async move {
+                let is_up = client.get(STATUS_URI).send().await;
+                let is_up = is_up.is_ok();
+
+                let response = ApiCheckerResponse {
+                    clients_count: 0,
+                    date_time: Utc::now(),
+                    is_up,
+                };
+
+                addr.do_send(response);
+            };
+
+            // fut.into_actor(self).spawn(ctx);
+        });
+    }
+}
+
+impl Handler<ApiCheckerResponse> for ApiCheckerActor {
+    type Result = ();
+
+    fn handle(&mut self, mut msg: ApiCheckerResponse, _ctx: &mut Self::Context) {
+        tracing::info!("API Checker: {msg:?}");
+        msg.clients_count = self.addresses.len();
+        for addr in self.addresses.iter() {
+            addr.do_send(msg.clone());
+        }
+    }
+}
+
+impl Handler<ApiCheckerMessage> for ApiCheckerActor {
+    type Result = ();
+
+    fn handle(&mut self, msg: ApiCheckerMessage, _ctx: &mut Self::Context) {
+        match msg {
+            ApiCheckerMessage::Connected(addr) => {
+                self.addresses.insert(addr);
+                // TODO: send the current status to the new client
+            }
+            ApiCheckerMessage::Disconnected(addr) => {
+                self.addresses.remove(&addr);
+                // TODO: send the current status to the remaining clients
+            }
+        }
+    }
+}
+
 struct WsActor {
-    app_state: Arc<Mutex<AppState>>,
+    api_checker_addr: Addr<ApiCheckerActor>,
 }
 
 impl WsActor {
-    fn new(app_state: Arc<Mutex<AppState>>) -> Self {
-        Self { app_state }
-    }
-
-    fn start(&mut self, ctx: &mut ws::WebsocketContext<Self>) {
-        let recipient = ctx.address().recipient();
-        let state = self.app_state.clone();
-
-        let fut = async move {
-            let mut rx = {
-                let mut state = state.lock().await;
-                state.clients_count += 1;
-                state.rx.clone()
-            };
-
-            while let Ok(()) = rx.changed().await {
-                let msg = rx.borrow().clone();
-                tracing::info!("WS: Sending {msg:?}");
-                recipient.do_send(msg);
-            }
-        };
-
-        fut.into_actor(self).spawn(ctx);
+    fn new(api_checker_addr: Addr<ApiCheckerActor>) -> Self {
+        Self { api_checker_addr }
     }
 }
 
@@ -62,14 +107,16 @@ impl Actor for WsActor {
     type Context = ws::WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        self.start(ctx);
+        let addr = ctx.address();
+        self.api_checker_addr
+            .do_send(ApiCheckerMessage::Connected(addr));
     }
 }
 
-impl Handler<Response> for WsActor {
+impl Handler<ApiCheckerResponse> for WsActor {
     type Result = ();
 
-    fn handle(&mut self, msg: Response, ctx: &mut Self::Context) {
+    fn handle(&mut self, msg: ApiCheckerResponse, ctx: &mut Self::Context) {
         let msg = serde_json::to_string(&msg).unwrap();
         ctx.text(msg);
     }
@@ -81,11 +128,8 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsActor {
         match msg {
             Ok(ws::Message::Text(text)) => ctx.text(text),
             Ok(ws::Message::Close(reason)) => {
-                let state = self.app_state.clone();
-                tokio::spawn(async move {
-                    let mut state = state.lock().await;
-                    state.clients_count -= 1;
-                });
+                self.api_checker_addr
+                    .do_send(ApiCheckerMessage::Disconnected(ctx.address()));
                 ctx.close(reason)
             }
             _ => (),
@@ -96,9 +140,11 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsActor {
 async fn websocket(
     req: HttpRequest,
     stream: web::Payload,
-    app_state: web::Data<Mutex<AppState>>,
+    app_state: web::Data<Addr<ApiCheckerActor>>,
 ) -> actix_web::Result<HttpResponse> {
-    let response = ws::start(WsActor::new(app_state.into_inner().clone()), &req, stream);
+    let addr = app_state.get_ref().clone();
+    let ws_actor = WsActor::new(addr);
+    let response = ws::start(ws_actor, &req, stream);
     tracing::info!("New WS: {response:?}");
     response
 }
@@ -112,39 +158,9 @@ async fn index() -> impl Responder {
 #[shuttle_service::main]
 async fn actix_web(
 ) -> ShuttleActixWeb<impl FnOnce(&mut ServiceConfig) + Sync + Send + Clone + 'static> {
-    let (tx, rx) = watch::channel(Response::default());
-
-    let state = Arc::new(Mutex::new(AppState {
-        clients_count: 0,
-        rx,
-    }));
-
-    // Spawn a thread to continually check the status of the api
-    let state_send = state.clone();
-
-    tokio::spawn(async move {
-        let duration = Duration::from_secs(PAUSE_SECS);
-        let client = reqwest::Client::default();
-
-        loop {
-            let is_up = client.get(STATUS_URI).send().await;
-            let is_up = is_up.is_ok();
-
-            let response = Response {
-                clients_count: state_send.lock().await.clients_count,
-                date_time: Utc::now(),
-                is_up,
-            };
-
-            if tx.send(response).is_err() {
-                break;
-            }
-
-            actix::clock::sleep(duration).await;
-        }
-    });
-
-    let app_state = web::Data::from(state);
+    // let's create an actor to continuously check the status of the shuttle
+    let api_checker_addr = ApiCheckerActor::default().start();
+    let app_state = web::Data::new(api_checker_addr);
 
     Ok(move |cfg: &mut ServiceConfig| {
         cfg.service(web::resource("/").route(web::get().to(index)))
@@ -154,4 +170,7 @@ async fn actix_web(
                     .route(web::get().to(websocket)),
             );
     })
+
+    // let api_checker_addr = ApiCheckerActor::default().start();
+    // then pass the actor address to the websocket handler
 }

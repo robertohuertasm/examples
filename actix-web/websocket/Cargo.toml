@@ -9,8 +9,9 @@ edition = "2021"
 shuttle-service = { version = "0.8.0", features = ["web-actix-web"] }
 shuttle-static-folder = "0.8.0"
 actix-web = "4.2.1"
+actix-rt = "2.7.0"
 actix-web-actors = "4.1.0"
-actix = "0.13.0"
+actix = "0.13"
 actix-files = "0.6.2"
 reqwest = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
