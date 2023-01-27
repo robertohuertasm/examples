@@ -37,7 +37,7 @@ struct ApiCheckerResponse {
 }
 
 impl Actor for ApiCheckerActor {
-    type Context = Context<Self>;
+    type Context = actix::Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
         let duration = Duration::from_secs(PAUSE_SECS);
@@ -155,7 +155,6 @@ async fn index() -> impl Responder {
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))
 }
 
-#[shuttle_service::main]
 async fn actix_web(
 ) -> ShuttleActixWeb<impl FnOnce(&mut ServiceConfig) + Sync + Send + Clone + 'static> {
     // let's create an actor to continuously check the status of the shuttle
@@ -173,4 +172,82 @@ async fn actix_web(
 
     // let api_checker_addr = ApiCheckerActor::default().start();
     // then pass the actor address to the websocket handler
+}
+
+async fn main(
+    _factory: &mut dyn shuttle_service::Factory,
+    runtime: &shuttle_service::Runtime,
+    logger: shuttle_service::Logger,
+) -> Result<Box<dyn shuttle_service::Service>, shuttle_service::Error> {
+    use shuttle_service::tracing_subscriber::prelude::*;
+
+    // set tracing
+    runtime
+        .spawn_blocking(move || {
+            let filter_layer =
+                shuttle_service::tracing_subscriber::EnvFilter::try_from_default_env()
+                    .or_else(|_| shuttle_service::tracing_subscriber::EnvFilter::try_new("INFO"))
+                    .unwrap();
+            shuttle_service::tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(logger)
+                .init();
+        })
+        .await
+        .map_err(|e| {
+            if e.is_panic() {
+                let mes = e
+                    .into_panic()
+                    .downcast_ref::<&str>()
+                    .map(|x| x.to_string())
+                    .unwrap_or_else(|| "panicked setting logger".to_string());
+                shuttle_service::Error::BuildPanic(mes)
+            } else {
+                shuttle_service::Error::Custom(
+                    shuttle_service::error::CustomError::new(e).context("failed to set logger"),
+                )
+            }
+        })?;
+
+    // run main function in a system runtime
+    runtime
+        .spawn(async {
+            actix_web()
+                .await
+                .map(|ok| Box::new(ok) as Box<dyn shuttle_service::Service>)
+        })
+        .await
+        .map_err(|e| {
+            if e.is_panic() {
+                let mes = e
+                    .into_panic()
+                    .downcast_ref::<&str>()
+                    .map(|x| x.to_string())
+                    .unwrap_or_else(|| "panicked calling main".to_string());
+                shuttle_service::Error::BuildPanic(mes)
+            } else {
+                shuttle_service::Error::Custom(
+                    shuttle_service::error::CustomError::new(e).context("failed to call main"),
+                )
+            }
+        })?
+}
+
+#[no_mangle]
+pub extern "C" fn _create_service() -> *mut shuttle_service::Bootstrapper {
+    use shuttle_service::Context;
+    let bootstrapper = shuttle_service::Bootstrapper::new(
+        |factory, runtime, logger| Box::pin(main(factory, runtime, logger)),
+        |srv, addr, runtime| {
+            runtime.spawn(async move {
+                srv.bind(addr)
+                    .await
+                    .context("failed to bind service")
+                    .map_err(Into::into)
+            })
+        },
+        shuttle_service::Runtime::new().unwrap(),
+    );
+    let boxed = Box::new(bootstrapper);
+    Box::into_raw(boxed)
 }
